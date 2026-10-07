@@ -29,6 +29,10 @@ external service.
 - EvidenceSeal: the immutable closing record for a reviewed case, including the
   selected accepted measurement.
 - AuditEvent: an append-only trace of meaningful case and device changes.
+- ReviewPacket: the frozen, independently verifiable snapshot of a sealed case,
+  bundling the case at its sealed version, the seal-selected measurement, the
+  evidence seal, and the bounded audit scope, plus a deterministic integrity
+  digest.
 
 ## Workflows
 
@@ -65,6 +69,20 @@ The verifier sends `POST /cases/{id}/seal` after an accepted measurement. Only
 measurement with the smallest absolute deviation, creates exactly one evidence
 seal, moves the case to `sealed`, and rejects later mutations.
 
+### 6. Freeze Review Packet
+
+A reviewer sends `POST /cases/{id}/review-packet` for a sealed case. The
+service freezes a review packet containing the case at its sealed version, the
+seal-selected measurement, the evidence seal, and the audit trail as a bounded
+scope, and stamps it with a SHA-256 digest over the canonical content. The
+packet is created at most once per case: a repeat request returns the already
+frozen packet unchanged (200 instead of 201), so the same case version can
+never yield contradictory packets. `GET /cases/{id}/review-packet` reads the
+frozen packet. Unsealed cases are rejected with `case_not_sealed`, and a case
+whose seal, selected measurement, or audit trail is incomplete is rejected
+with `incomplete_evidence`, so a partial record can never be mistaken for
+formal evidence.
+
 ## State And Rules
 
 Device state:
@@ -90,6 +108,13 @@ Required invariants:
 - A sealed case cannot accept measurements, reopen, or seal again.
 - Every mutation that changes a case also appends an audit event in the same
   repository commit.
+- A review packet can be frozen only for a sealed case with a complete seal,
+  selected measurement, and audit trail.
+- A case has at most one review packet; packets are append-only and are never
+  rewritten after the freeze.
+- A packet digest is a deterministic function of the sealed case version's
+  evidence content, so regenerating for the same case version reproduces the
+  same packet identity and digest.
 
 ## Modules
 
@@ -113,6 +138,21 @@ Required invariants:
 - `POST /cases/{id}/reopen`
 - `POST /cases/{id}/seal`
 - `GET /cases/{id}/events`
+- `POST /cases/{id}/review-packet`
+- `GET /cases/{id}/review-packet`
+
+## Review Packet Integrity
+
+The packet digest is the lowercase hex SHA-256 of the canonical JSON object
+`{"schema":"metrology.review-packet/v1","case":...,"measurement":...,"seal":...,"events":[...]}`,
+serialized with Go `encoding/json` semantics (struct field declaration order,
+shortest round-trip floats, RFC3339Nano timestamps). The digest covers only
+the evidence content, not the freeze time, so it is a pure function of the
+sealed case version. Any auditor can recompute it from the packet alone; the
+`audit_scope` block bounds the included audit trail so later additions to the
+live trail are visibly outside the frozen scope. The digest schema is
+versioned: a future standard change produces a new schema marker and never
+rewrites already frozen packets.
 
 ## Validation Plan
 

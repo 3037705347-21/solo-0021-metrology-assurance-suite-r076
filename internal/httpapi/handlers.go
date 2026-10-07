@@ -106,3 +106,29 @@ func (s *Server) events(writer http.ResponseWriter, request *http.Request) {
 	}
 	writeJSON(writer, http.StatusOK, contracts.EventsResponse{Events: view.Events})
 }
+
+// freezeReviewPacket freezes (or returns the already frozen) review packet
+// for a sealed case. The first request creates the packet (201); any repeat
+// request for the same sealed case version returns the identical packet
+// (200), so clients can never observe contradictory packets.
+func (s *Server) freezeReviewPacket(writer http.ResponseWriter, request *http.Request) {
+	packet, created, err := s.service.FreezeReviewPacket(request.Context(), request.PathValue("id"))
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSON(writer, status, contracts.ReviewPacketResponse{Packet: packet})
+}
+
+func (s *Server) reviewPacket(writer http.ResponseWriter, request *http.Request) {
+	packet, err := s.service.ReviewPacket(request.Context(), request.PathValue("id"))
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, contracts.ReviewPacketResponse{Packet: packet})
+}

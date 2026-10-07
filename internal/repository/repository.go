@@ -14,6 +14,7 @@ type Repository struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	packets      map[string]domain.ReviewPacket
 	events       []domain.AuditEvent
 	counters     map[string]int
 }
@@ -24,6 +25,7 @@ func New() *Repository {
 		cases:        make(map[string]domain.VerificationCase),
 		measurements: make(map[string][]domain.Measurement),
 		seals:        make(map[string]domain.EvidenceSeal),
+		packets:      make(map[string]domain.ReviewPacket),
 		counters:     make(map[string]int),
 	}
 }
@@ -33,6 +35,7 @@ type Snapshot struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	packets      map[string]domain.ReviewPacket
 	events       []domain.AuditEvent
 }
 
@@ -61,6 +64,11 @@ func (s Snapshot) Measurements(caseID string) []domain.Measurement {
 
 func (s Snapshot) Seal(caseID string) (domain.EvidenceSeal, bool) {
 	item, ok := s.seals[caseID]
+	return item, ok
+}
+
+func (s Snapshot) ReviewPacket(caseID string) (domain.ReviewPacket, bool) {
+	item, ok := s.packets[caseID]
 	return item, ok
 }
 
@@ -95,6 +103,7 @@ type Mutation struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	packets      map[string]domain.ReviewPacket
 	events       []domain.AuditEvent
 	counters     map[string]int
 }
@@ -189,6 +198,21 @@ func (m *Mutation) PutSeal(item domain.EvidenceSeal) error {
 	return nil
 }
 
+func (m *Mutation) ReviewPacket(caseID string) (domain.ReviewPacket, bool) {
+	item, ok := m.packets[caseID]
+	return item, ok
+}
+
+// PutPacket freezes a review packet. Packets are append-only: a case can
+// never have its frozen packet replaced or rewritten.
+func (m *Mutation) PutPacket(item domain.ReviewPacket) error {
+	if _, exists := m.packets[item.CaseID]; exists {
+		return fmt.Errorf("%w: case %s", domain.ErrReviewPacketAlreadyCreated, item.CaseID)
+	}
+	m.packets[item.CaseID] = item
+	return nil
+}
+
 func (m *Mutation) AppendEvent(item domain.AuditEvent) {
 	m.events = append(m.events, item)
 }
@@ -224,6 +248,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
+		packets:      clonePackets(r.packets),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 		counters:     cloneCounters(r.counters),
 	}
@@ -234,6 +259,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	r.cases = next.cases
 	r.measurements = next.measurements
 	r.seals = next.seals
+	r.packets = next.packets
 	r.events = next.events
 	r.counters = next.counters
 	return nil
@@ -245,6 +271,7 @@ func (r *Repository) snapshot() Snapshot {
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
+		packets:      clonePackets(r.packets),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 	}
 }
@@ -275,6 +302,14 @@ func cloneMeasurements(values map[string][]domain.Measurement) map[string][]doma
 
 func cloneSeals(values map[string]domain.EvidenceSeal) map[string]domain.EvidenceSeal {
 	result := make(map[string]domain.EvidenceSeal, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
+}
+
+func clonePackets(values map[string]domain.ReviewPacket) map[string]domain.ReviewPacket {
+	result := make(map[string]domain.ReviewPacket, len(values))
 	for key, value := range values {
 		result[key] = value
 	}

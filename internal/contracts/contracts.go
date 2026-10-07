@@ -46,6 +46,10 @@ type EventsResponse struct {
 	Events []domain.AuditEvent `json:"events"`
 }
 
+type ReviewPacketResponse struct {
+	Packet domain.ReviewPacket `json:"packet"`
+}
+
 type ErrorResponse struct {
 	Error ErrorBody `json:"error"`
 }

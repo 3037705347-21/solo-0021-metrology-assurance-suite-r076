@@ -288,6 +288,77 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 	return result, err
 }
 
+// FreezeReviewPacket returns the frozen review packet for a sealed case. The
+// packet is created at most once per case: the digest is a deterministic
+// function of the sealed case version's evidence, and a repeat request inside
+// the same atomic commit returns the already frozen packet, so two requests
+// can never observe contradictory content.
+func (s *Service) FreezeReviewPacket(ctx context.Context, caseID string) (domain.ReviewPacket, bool, error) {
+	var packet domain.ReviewPacket
+	created := false
+	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+		id := strings.TrimSpace(caseID)
+		item, exists := m.Case(id)
+		if !exists {
+			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
+		}
+		if existing, exists := m.ReviewPacket(item.ID); exists {
+			packet = existing
+			return nil
+		}
+		if item.State != domain.CaseSealed {
+			return fmt.Errorf("%w: case %s is %s", domain.ErrCaseNotSealed, item.ID, item.State)
+		}
+		seal, exists := m.Seal(item.ID)
+		if !exists {
+			return fmt.Errorf("%w: case %s has no evidence seal", domain.ErrIncompleteEvidence, item.ID)
+		}
+		measurement, ok := measurementByID(m.Measurements(item.ID), seal.MeasurementID)
+		if !ok {
+			return fmt.Errorf("%w: case %s is missing the seal-selected measurement", domain.ErrIncompleteEvidence, item.ID)
+		}
+		frozen, err := domain.FreezeReviewPacket(item, measurement, seal, m.Events(item.ID), s.now())
+		if err != nil {
+			return err
+		}
+		if err := m.PutPacket(frozen); err != nil {
+			return err
+		}
+		packet = frozen
+		created = true
+		return nil
+	})
+	return packet, created, err
+}
+
+// ReviewPacket reads the frozen review packet for a case. It never recomputes
+// or refreshes the packet: what was frozen is what is returned.
+func (s *Service) ReviewPacket(ctx context.Context, caseID string) (domain.ReviewPacket, error) {
+	var packet domain.ReviewPacket
+	err := s.repository.Read(ctx, func(snapshot repository.Snapshot) error {
+		id := strings.TrimSpace(caseID)
+		if _, exists := snapshot.Case(id); !exists {
+			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
+		}
+		item, exists := snapshot.ReviewPacket(id)
+		if !exists {
+			return fmt.Errorf("%w: review packet for case %s", domain.ErrNotFound, id)
+		}
+		packet = item
+		return nil
+	})
+	return packet, err
+}
+
+func measurementByID(items []domain.Measurement, id string) (domain.Measurement, bool) {
+	for _, item := range items {
+		if item.ID == id {
+			return item, true
+		}
+	}
+	return domain.Measurement{}, false
+}
+
 func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bool) {
 	var selected domain.Measurement
 	found := false

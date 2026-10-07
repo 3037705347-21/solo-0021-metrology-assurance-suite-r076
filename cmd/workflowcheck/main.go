@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"example.com/solo-0021-metrology-assurance-suite/internal/bootstrap"
+	"example.com/solo-0021-metrology-assurance-suite/internal/contracts"
+	"example.com/solo-0021-metrology-assurance-suite/internal/domain"
 )
 
 type apiResponse struct {
@@ -40,6 +42,7 @@ func main() {
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
+		"freeze-review-packet":     checkFreezeReviewPacket,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -371,6 +374,259 @@ func checkSealVerification() error {
 	}
 	if sealID == "" {
 		return errors.New("evidence seal is missing")
+	}
+	return nil
+}
+
+func checkFreezeReviewPacket() error {
+	h := newHarness()
+	defer h.close()
+
+	caseID, err := h.readyCase("MET-1501")
+	if err != nil {
+		return err
+	}
+
+	// An unsealed case must not produce anything that looks like evidence.
+	early, err := h.request(http.MethodPost, "/cases/"+caseID+"/review-packet", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(early, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(early, "case_not_sealed"); err != nil {
+		return err
+	}
+	missing, err := h.request(http.MethodGet, "/cases/"+caseID+"/review-packet", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(missing, http.StatusNotFound); err != nil {
+		return err
+	}
+
+	sealed, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Reviewer-A",
+		"summary":  "accepted measurement sealed for review",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealed, http.StatusCreated); err != nil {
+		return err
+	}
+	sealID, err := nestedString(sealed.Body, "seal", "id")
+	if err != nil {
+		return err
+	}
+	sealMeasurementID, err := nestedString(sealed.Body, "seal", "measurement_id")
+	if err != nil {
+		return err
+	}
+
+	frozen, err := h.request(http.MethodPost, "/cases/"+caseID+"/review-packet", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(frozen, http.StatusCreated); err != nil {
+		return err
+	}
+	if err := expectPacketShape(frozen.Body, caseID, sealID, sealMeasurementID); err != nil {
+		return err
+	}
+
+	// Regenerating the same sealed case version returns the identical packet.
+	again, err := h.request(http.MethodPost, "/cases/"+caseID+"/review-packet", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(again, http.StatusOK); err != nil {
+		return err
+	}
+	if again.Raw != frozen.Raw {
+		return fmt.Errorf("regenerated packet differs:\nfirst:  %s\nsecond: %s", frozen.Raw, again.Raw)
+	}
+
+	// Reading the frozen packet returns the identical frozen content.
+	fetched, err := h.request(http.MethodGet, "/cases/"+caseID+"/review-packet", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(fetched, http.StatusOK); err != nil {
+		return err
+	}
+	if fetched.Raw != frozen.Raw {
+		return fmt.Errorf("fetched packet differs from frozen packet:\nfrozen:  %s\nfetched: %s", frozen.Raw, fetched.Raw)
+	}
+
+	// Independent verification: recompute the digest from the packet content.
+	var view contracts.ReviewPacketResponse
+	if err := json.Unmarshal([]byte(fetched.Raw), &view); err != nil {
+		return fmt.Errorf("decode review packet: %w", err)
+	}
+	if !view.Packet.VerifyDigest() {
+		return errors.New("packet digest does not match its content")
+	}
+	recomputed := domain.ComputeReviewPacketDigest(view.Packet.Case, view.Packet.Measurement, view.Packet.Seal, view.Packet.Events)
+	if recomputed != view.Packet.Digest {
+		return fmt.Errorf("recomputed digest %q != packet digest %q", recomputed, view.Packet.Digest)
+	}
+
+	// Later case data changes are rejected and cannot rewrite the packet.
+	lateMeasurement, err := h.recordMeasurement(caseID, 25.1, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(lateMeasurement, http.StatusConflict); err != nil {
+		return err
+	}
+	lateReopen, err := h.request(http.MethodPost, "/cases/"+caseID+"/reopen", map[string]any{
+		"actor":  "Lin",
+		"reason": "late amendment attempt",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(lateReopen, http.StatusConflict); err != nil {
+		return err
+	}
+	refetched, err := h.request(http.MethodGet, "/cases/"+caseID+"/review-packet", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(refetched, http.StatusOK); err != nil {
+		return err
+	}
+	if refetched.Raw != frozen.Raw {
+		return errors.New("packet changed after rejected mutation attempts")
+	}
+
+	// Concurrent freeze requests on a fresh sealed case produce exactly one
+	// packet: one 201, one 200, identical content.
+	raceCaseID, err := h.readyCase("MET-1502")
+	if err != nil {
+		return err
+	}
+	raceSealed, err := h.request(http.MethodPost, "/cases/"+raceCaseID+"/seal", map[string]any{
+		"reviewer": "Reviewer-B",
+		"summary":  "accepted measurement sealed for review",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(raceSealed, http.StatusCreated); err != nil {
+		return err
+	}
+	type outcome struct {
+		response apiResponse
+		err      error
+	}
+	results := make(chan outcome, 2)
+	var wait sync.WaitGroup
+	for index := 0; index < 2; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			response, err := h.request(http.MethodPost, "/cases/"+raceCaseID+"/review-packet", nil)
+			results <- outcome{response: response, err: err}
+		}()
+	}
+	wait.Wait()
+	close(results)
+
+	created := 0
+	existing := 0
+	var raceRaw string
+	for item := range results {
+		if item.err != nil {
+			return item.err
+		}
+		switch item.response.Status {
+		case http.StatusCreated:
+			created++
+		case http.StatusOK:
+			existing++
+		default:
+			return fmt.Errorf("unexpected concurrent freeze status %d: %s", item.response.Status, item.response.Raw)
+		}
+		if raceRaw == "" {
+			raceRaw = item.response.Raw
+		} else if raceRaw != item.response.Raw {
+			return errors.New("concurrent freeze returned contradictory packets")
+		}
+	}
+	if created != 1 || existing != 1 {
+		return fmt.Errorf("concurrent freeze outcomes: %d created, %d existing", created, existing)
+	}
+	return nil
+}
+
+func expectPacketShape(body map[string]any, caseID, sealID, measurementID string) error {
+	packetCaseID, err := nestedString(body, "packet", "case", "id")
+	if err != nil {
+		return err
+	}
+	if packetCaseID != caseID {
+		return fmt.Errorf("packet case id = %q, expected %q", packetCaseID, caseID)
+	}
+	state, err := nestedString(body, "packet", "case", "state")
+	if err != nil {
+		return err
+	}
+	if state != "sealed" {
+		return fmt.Errorf("packet case state = %q", state)
+	}
+	packetSealID, err := nestedString(body, "packet", "seal", "id")
+	if err != nil {
+		return err
+	}
+	if packetSealID != sealID {
+		return fmt.Errorf("packet seal id = %q, expected %q", packetSealID, sealID)
+	}
+	packetMeasurementID, err := nestedString(body, "packet", "measurement", "id")
+	if err != nil {
+		return err
+	}
+	if packetMeasurementID != measurementID {
+		return fmt.Errorf("packet measurement id = %q, expected %q", packetMeasurementID, measurementID)
+	}
+	digest, err := nestedString(body, "packet", "digest")
+	if err != nil {
+		return err
+	}
+	if len(digest) != 64 {
+		return fmt.Errorf("packet digest %q is not a sha256 hex string", digest)
+	}
+	algorithm, err := nestedString(body, "packet", "digest_algorithm")
+	if err != nil {
+		return err
+	}
+	if algorithm != "sha256" {
+		return fmt.Errorf("packet digest algorithm = %q", algorithm)
+	}
+	packet, ok := body["packet"].(map[string]any)
+	if !ok {
+		return errors.New("packet is not an object")
+	}
+	eventItems, ok := packet["events"].([]any)
+	if !ok || len(eventItems) == 0 {
+		return errors.New("packet events are missing")
+	}
+	scope, ok := packet["audit_scope"].(map[string]any)
+	if !ok {
+		return errors.New("packet audit scope is missing")
+	}
+	count, ok := scope["event_count"].(float64)
+	if !ok || int(count) != len(eventItems) {
+		return fmt.Errorf("audit scope count %v does not match %d events", scope["event_count"], len(eventItems))
+	}
+	last, ok := eventItems[len(eventItems)-1].(map[string]any)
+	if !ok || last["kind"] != "case_sealed" {
+		return errors.New("packet audit trail does not end at the seal event")
+	}
+	if scope["last_event_id"] != last["id"] {
+		return errors.New("audit scope last event does not match the final packet event")
 	}
 	return nil
 }

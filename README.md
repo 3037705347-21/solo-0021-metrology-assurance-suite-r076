@@ -22,6 +22,7 @@ go run ./cmd/workflowcheck --workflow open-verification-case
 go run ./cmd/workflowcheck --workflow record-measurement
 go run ./cmd/workflowcheck --workflow reopen-verification-case
 go run ./cmd/workflowcheck --workflow seal-verification
+go run ./cmd/workflowcheck --workflow freeze-review-packet
 ```
 
 The workflow runner starts a fresh in-process HTTP service and exercises the
@@ -42,6 +43,19 @@ or extend these smoke checks with red/green verification tests.
 - `POST /cases/{id}/reopen`
 - `POST /cases/{id}/seal`
 - `GET /cases/{id}/events`
+- `POST /cases/{id}/review-packet`
+- `GET /cases/{id}/review-packet`
+
+`POST /cases/{id}/review-packet` freezes an immutable review packet for a
+sealed case: the case at its sealed version, the seal-selected measurement,
+the evidence seal, and the bounded audit scope, plus a SHA-256 integrity
+digest over the canonical content. The first request returns `201`; repeating
+it for the same sealed case version returns `200` with the identical packet,
+and later case or standard changes never rewrite it. Unsealed or incomplete
+cases are rejected with `409` (`case_not_sealed` / `incomplete_evidence`), so
+a partial record can never be mistaken for formal evidence. The digest is
+computable from the packet alone (schema `metrology.review-packet/v1`), so an
+external auditor can verify integrity independently.
 
 ## Layout
 

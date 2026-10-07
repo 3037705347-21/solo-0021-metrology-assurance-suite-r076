@@ -155,6 +155,28 @@
         "contracts",
         "bootstrap"
       ]
+    },
+    {
+      "id": "freeze-review-packet",
+      "name": "Freeze review packet",
+      "entry": "POST /cases/{id}/review-packet",
+      "steps": [
+        "verify the case exists and is sealed",
+        "assemble the case, seal-selected measurement, seal, and bounded audit scope",
+        "freeze one immutable packet with a deterministic integrity digest"
+      ],
+      "success": "returns the frozen review packet; repeats return the identical packet",
+      "failure": "returns case_not_sealed or incomplete_evidence conflicts, or not-found",
+      "verification": "workflowcheck rejects an unsealed freeze, freezes a sealed case, verifies idempotent regeneration, recomputes the digest independently, and races two freeze requests",
+      "module_ids": [
+        "runtimecheck",
+        "httpapi",
+        "assurance",
+        "domain",
+        "repository",
+        "contracts",
+        "bootstrap"
+      ]
     }
   ],
   "complexity": {
