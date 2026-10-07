@@ -2,6 +2,8 @@ package assurance
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
@@ -288,6 +290,140 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 	return result, err
 }
 
+// GenerateReviewPacket freezes a sealed case version into a stable review
+// packet. Repeating the request for the same case version returns the same
+// stored packet; unsealed or incomplete cases are rejected.
+func (s *Service) GenerateReviewPacket(ctx context.Context, caseID string, input contracts.FreezeReviewPacketRequest) (domain.ReviewPacket, bool, error) {
+	reviewer := strings.TrimSpace(input.Reviewer)
+	if reviewer == "" {
+		return domain.ReviewPacket{}, false, fmt.Errorf("%w: reviewer is required", domain.ErrInvalidInput)
+	}
+
+	var packet domain.ReviewPacket
+	created := false
+	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+		id := strings.TrimSpace(caseID)
+		item, exists := m.Case(id)
+		if !exists {
+			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
+		}
+		if item.State != domain.CaseSealed {
+			return fmt.Errorf("%w: case %s is %s, only a sealed case can be frozen", domain.ErrStateConflict, item.ID, item.State)
+		}
+		if existing, exists := m.Packet(item.ID, item.Version); exists {
+			packet = existing
+			return nil
+		}
+
+		seal, exists := m.Seal(item.ID)
+		if !exists {
+			return fmt.Errorf("%w: case %s has no evidence seal", domain.ErrStateConflict, item.ID)
+		}
+		var selected *domain.Measurement
+		for _, measurement := range m.Measurements(item.ID) {
+			measurement := measurement
+			if measurement.ID == seal.MeasurementID {
+				selected = &measurement
+				break
+			}
+		}
+		if selected == nil {
+			return fmt.Errorf("%w: seal %s selects missing measurement %s", domain.ErrStateConflict, seal.ID, seal.MeasurementID)
+		}
+		device, exists := m.Device(item.DeviceID)
+		if !exists {
+			return fmt.Errorf("%w: device %s for case %s", domain.ErrNotFound, item.DeviceID, item.ID)
+		}
+		// Snapshot the audit trail before appending the freeze event, so the
+		// packet proves evidence that existed at freeze time and later
+		// retroactive entries can never bleed into an old packet.
+		events := m.Events(item.ID)
+
+		built, err := domain.NewReviewPacket(
+			m.NextID("packet"),
+			reviewer,
+			s.now(),
+			item,
+			device,
+			seal,
+			*selected,
+			events,
+		)
+		if err != nil {
+			return err
+		}
+		if err := m.PutFreeze(built); err != nil {
+			return err
+		}
+		event, err := domain.NewAuditEvent(
+			m.NextID("event"),
+			"review_packet",
+			built.ID,
+			item.ID,
+			"review_packet_frozen",
+			reviewer,
+			fmt.Sprintf("review packet %s frozen for case version %d with digest %s", built.ID, item.Version, built.Digest),
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		m.AppendEvent(event)
+		packet = built
+		created = true
+		return nil
+	})
+	return packet, created, err
+}
+
+// ReviewPacket reads the frozen packet for a sealed case. The stored snapshot
+// is returned as-is; live case data never replaces the frozen payload.
+func (s *Service) ReviewPacket(ctx context.Context, caseID string) (domain.ReviewPacket, error) {
+	var packet domain.ReviewPacket
+	err := s.repository.Read(ctx, func(snapshot repository.Snapshot) error {
+		id := strings.TrimSpace(caseID)
+		item, exists := snapshot.Case(id)
+		if !exists {
+			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
+		}
+		if found, exists := snapshot.PacketForCase(item.ID); exists {
+			packet = found
+			return nil
+		}
+		return fmt.Errorf("%w: no review packet has been frozen for case %s", domain.ErrNotFound, item.ID)
+	})
+	return packet, err
+}
+
+// VerifyReviewPacket recomputes the digest of a stored packet from its frozen
+// payload and returns both digests plus the canonical manifest bytes, so an
+// external reviewer can independently hash the same content.
+func (s *Service) VerifyReviewPacket(ctx context.Context, caseID string) (contracts.ReviewPacketVerificationResponse, error) {
+	packet, err := s.ReviewPacket(ctx, caseID)
+	if err != nil {
+		return contracts.ReviewPacketVerificationResponse{}, err
+	}
+	manifest, err := packet.CanonicalManifest()
+	if err != nil {
+		return contracts.ReviewPacketVerificationResponse{}, err
+	}
+	verified, err := packet.Verify()
+	if err != nil {
+		return contracts.ReviewPacketVerificationResponse{}, err
+	}
+	return contracts.ReviewPacketVerificationResponse{
+		CaseID:            packet.CaseID,
+		PacketID:          packet.ID,
+		CaseVersion:       packet.CaseVersion,
+		SchemaVersion:     packet.SchemaVersion,
+		DigestAlg:         packet.DigestAlg,
+		StoredDigest:      packet.Digest,
+		ComputedDigest:    sha256Hex(manifest),
+		Verified:          verified,
+		CanonicalManifest: string(manifest),
+	}, nil
+}
+
 func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bool) {
 	var selected domain.Measurement
 	found := false
@@ -301,6 +437,11 @@ func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bo
 		}
 	}
 	return selected, found
+}
+
+func sha256Hex(content []byte) string {
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:])
 }
 
 func caseResponse(m *repository.Mutation, item domain.VerificationCase) contracts.CaseResponse {

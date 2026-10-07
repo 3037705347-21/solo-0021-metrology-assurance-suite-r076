@@ -14,8 +14,15 @@ type Repository struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	packets      map[string]domain.ReviewPacket
 	events       []domain.AuditEvent
 	counters     map[string]int
+}
+
+// packetKey binds a frozen packet to one exact case version, so the same
+// sealed version can never yield two contradictory packets.
+func packetKey(caseID string, version int) string {
+	return fmt.Sprintf("%s#%d", caseID, version)
 }
 
 func New() *Repository {
@@ -24,6 +31,7 @@ func New() *Repository {
 		cases:        make(map[string]domain.VerificationCase),
 		measurements: make(map[string][]domain.Measurement),
 		seals:        make(map[string]domain.EvidenceSeal),
+		packets:      make(map[string]domain.ReviewPacket),
 		counters:     make(map[string]int),
 	}
 }
@@ -33,6 +41,7 @@ type Snapshot struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	packets      map[string]domain.ReviewPacket
 	events       []domain.AuditEvent
 }
 
@@ -90,11 +99,29 @@ func (s Snapshot) AllCases() []domain.VerificationCase {
 	return result
 }
 
+// Packet returns the frozen packet for one exact case version.
+func (s Snapshot) Packet(caseID string, version int) (domain.ReviewPacket, bool) {
+	item, ok := s.packets[packetKey(caseID, version)]
+	return item, ok
+}
+
+// PacketForCase returns the frozen packet recorded for the case, regardless
+// of the version embedded in the case record.
+func (s Snapshot) PacketForCase(caseID string) (domain.ReviewPacket, bool) {
+	for _, item := range s.packets {
+		if item.CaseID == caseID {
+			return item, true
+		}
+	}
+	return domain.ReviewPacket{}, false
+}
+
 type Mutation struct {
 	devices      map[string]domain.Device
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	packets      map[string]domain.ReviewPacket
 	events       []domain.AuditEvent
 	counters     map[string]int
 }
@@ -189,6 +216,42 @@ func (m *Mutation) PutSeal(item domain.EvidenceSeal) error {
 	return nil
 }
 
+// Packet returns the frozen packet for one exact case version.
+func (m *Mutation) Packet(caseID string, version int) (domain.ReviewPacket, bool) {
+	item, ok := m.packets[packetKey(caseID, version)]
+	return item, ok
+}
+
+// PacketForCase returns any frozen packet recorded for the case.
+func (m *Mutation) PacketForCase(caseID string) (domain.ReviewPacket, bool) {
+	for _, item := range m.packets {
+		if item.CaseID == caseID {
+			return item, true
+		}
+	}
+	return domain.ReviewPacket{}, false
+}
+
+// PutFreeze stores an already-built frozen packet under its case version.
+// Stored packets are immutable: the method rejects any attempt to overwrite
+// an existing packet for the same case version.
+func (m *Mutation) PutFreeze(item domain.ReviewPacket) error {
+	if err := item.Validate(); err != nil {
+		return err
+	}
+	key := packetKey(item.CaseID, item.CaseVersion)
+	if _, exists := m.packets[key]; exists {
+		return fmt.Errorf("%w: review packet already frozen for case %s version %d", domain.ErrStateConflict, item.CaseID, item.CaseVersion)
+	}
+	for _, existing := range m.packets {
+		if existing.ID == item.ID {
+			return fmt.Errorf("%w: review packet %s is already stored", domain.ErrStateConflict, item.ID)
+		}
+	}
+	m.packets[key] = item
+	return nil
+}
+
 func (m *Mutation) AppendEvent(item domain.AuditEvent) {
 	m.events = append(m.events, item)
 }
@@ -224,6 +287,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
+		packets:      clonePackets(r.packets),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 		counters:     cloneCounters(r.counters),
 	}
@@ -234,6 +298,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	r.cases = next.cases
 	r.measurements = next.measurements
 	r.seals = next.seals
+	r.packets = next.packets
 	r.events = next.events
 	r.counters = next.counters
 	return nil
@@ -245,6 +310,7 @@ func (r *Repository) snapshot() Snapshot {
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
+		packets:      clonePackets(r.packets),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 	}
 }
@@ -276,6 +342,17 @@ func cloneMeasurements(values map[string][]domain.Measurement) map[string][]doma
 func cloneSeals(values map[string]domain.EvidenceSeal) map[string]domain.EvidenceSeal {
 	result := make(map[string]domain.EvidenceSeal, len(values))
 	for key, value := range values {
+		result[key] = value
+	}
+	return result
+}
+
+func clonePackets(values map[string]domain.ReviewPacket) map[string]domain.ReviewPacket {
+	result := make(map[string]domain.ReviewPacket, len(values))
+	for key, value := range values {
+		value.FrozenEvents = append([]domain.AuditEvent(nil), value.FrozenEvents...)
+		value.Scope.Sections = append([]string(nil), value.Scope.Sections...)
+		value.Scope.MeasurementIDs = append([]string(nil), value.Scope.MeasurementIDs...)
 		result[key] = value
 	}
 	return result

@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -40,6 +42,7 @@ func main() {
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
+		"freeze-review-packet":     checkFreezeReviewPacket,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -375,6 +378,301 @@ func checkSealVerification() error {
 	return nil
 }
 
+func checkFreezeReviewPacket() error {
+	h := newHarness()
+	defer h.close()
+
+	// An unsealed (review_ready) case must never produce a packet that could
+	// be mistaken for formal evidence.
+	readyCaseID, err := h.readyCase("MET-1501")
+	if err != nil {
+		return err
+	}
+	rejected, err := h.request(http.MethodPost, "/cases/"+readyCaseID+"/review-packet", map[string]any{
+		"reviewer": "Auditor-An",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(rejected, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(rejected, "state_conflict"); err != nil {
+		return err
+	}
+
+	// A missing reviewer is rejected before any packet is created.
+	invalid, err := h.request(http.MethodPost, "/cases/"+readyCaseID+"/review-packet", map[string]any{
+		"reviewer": "   ",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(invalid, http.StatusBadRequest); err != nil {
+		return err
+	}
+
+	sealed, err := h.request(http.MethodPost, "/cases/"+readyCaseID+"/seal", map[string]any{
+		"reviewer": "Reviewer-He",
+		"summary":  "accepted measurement sealed for external review",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealed, http.StatusCreated); err != nil {
+		return err
+	}
+	sealedVersion, err := nestedFloat(sealed.Body, "case", "version")
+	if err != nil {
+		return err
+	}
+
+	first, err := h.request(http.MethodPost, "/cases/"+readyCaseID+"/review-packet", map[string]any{
+		"reviewer": "Auditor-An",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(first, http.StatusCreated); err != nil {
+		return err
+	}
+	packetID, err := nestedString(first.Body, "packet", "id")
+	if err != nil {
+		return err
+	}
+	digest, err := nestedString(first.Body, "packet", "digest")
+	if err != nil {
+		return err
+	}
+	digestAlg, err := nestedString(first.Body, "packet", "digest_alg")
+	if err != nil {
+		return err
+	}
+	if digestAlg != "sha256" || len(digest) != 64 {
+		return fmt.Errorf("unexpected digest %s (%s)", digest, digestAlg)
+	}
+	frozenCaseID, err := nestedString(first.Body, "packet", "frozen_case", "id")
+	if err != nil {
+		return err
+	}
+	if frozenCaseID != readyCaseID {
+		return fmt.Errorf("frozen case id = %q, expected %q", frozenCaseID, readyCaseID)
+	}
+	frozenVersion, err := nestedFloat(first.Body, "packet", "case_version")
+	if err != nil {
+		return err
+	}
+	if frozenVersion != sealedVersion {
+		return fmt.Errorf("frozen version = %v, expected %v", frozenVersion, sealedVersion)
+	}
+	frozenState, err := nestedString(first.Body, "packet", "frozen_case", "state")
+	if err != nil {
+		return err
+	}
+	if frozenState != "sealed" {
+		return fmt.Errorf("frozen case state = %q", frozenState)
+	}
+	frozenMeasurementCase, err := nestedString(first.Body, "packet", "frozen_measurement", "case_id")
+	if err != nil {
+		return err
+	}
+	if frozenMeasurementCase != readyCaseID {
+		return fmt.Errorf("frozen measurement belongs to case %q", frozenMeasurementCase)
+	}
+	selectedMeasurementID, err := nestedString(first.Body, "packet", "frozen_seal", "measurement_id")
+	if err != nil {
+		return err
+	}
+	frozenMeasurementID, err := nestedString(first.Body, "packet", "frozen_measurement", "id")
+	if err != nil {
+		return err
+	}
+	if selectedMeasurementID != frozenMeasurementID {
+		return fmt.Errorf("seal selects %s but packet carries measurement %s", selectedMeasurementID, frozenMeasurementID)
+	}
+	frozenEvents, err := nestedSlice(first.Body["packet"].(map[string]any), "frozen_events")
+	if err != nil {
+		return err
+	}
+	if len(frozenEvents) == 0 {
+		return errors.New("frozen packet has no audit scope")
+	}
+	scopeSections, err := nestedAny(first.Body, "packet", "scope", "sections")
+	if err != nil {
+		return err
+	}
+	sections, ok := scopeSections.([]any)
+	if !ok || len(sections) != 5 {
+		return fmt.Errorf("packet scope sections = %v", scopeSections)
+	}
+
+	// Repeating the freeze for the same sealed version is idempotent and
+	// cannot yield a contradictory packet.
+	second, err := h.request(http.MethodPost, "/cases/"+readyCaseID+"/review-packet", map[string]any{
+		"reviewer": "Auditor-An",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(second, http.StatusOK); err != nil {
+		return err
+	}
+	secondID, err := nestedString(second.Body, "packet", "id")
+	if err != nil {
+		return err
+	}
+	secondDigest, err := nestedString(second.Body, "packet", "digest")
+	if err != nil {
+		return err
+	}
+	if secondID != packetID || secondDigest != digest {
+		return errors.New("repeated freeze produced a different packet")
+	}
+
+	// The stored packet is independently readable.
+	read, err := h.request(http.MethodGet, "/cases/"+readyCaseID+"/review-packet", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(read, http.StatusOK); err != nil {
+		return err
+	}
+	readDigest, err := nestedString(read.Body, "packet", "digest")
+	if err != nil {
+		return err
+	}
+	if readDigest != digest {
+		return errors.New("stored packet read returned a different digest")
+	}
+
+	// Verification recomputes the digest and exposes the canonical manifest so
+	// a reviewer can hash the bytes with an external tool.
+	verification, err := h.request(http.MethodGet, "/cases/"+readyCaseID+"/review-packet/verify", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(verification, http.StatusOK); err != nil {
+		return err
+	}
+	verified, err := nestedBool(verification.Body, "verified")
+	if err != nil {
+		return err
+	}
+	if !verified {
+		return errors.New("freshly frozen packet failed verification")
+	}
+	computed, err := nestedString(verification.Body, "computed_digest")
+	if err != nil {
+		return err
+	}
+	stored, err := nestedString(verification.Body, "stored_digest")
+	if err != nil {
+		return err
+	}
+	if computed != stored || stored != digest {
+		return fmt.Errorf("digest mismatch: stored %s computed %s", stored, computed)
+	}
+	manifest, err := nestedString(verification.Body, "canonical_manifest")
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256([]byte(manifest))
+	independentDigest := hex.EncodeToString(sum[:])
+	if independentDigest != digest {
+		return fmt.Errorf("external sha256 of manifest = %s, expected %s", independentDigest, digest)
+	}
+
+	// The freeze event belongs to the live audit trail, but it was appended
+	// after the snapshot and a repeated freeze does not add another event.
+	liveCase, err := h.request(http.MethodGet, "/cases/"+readyCaseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(liveCase, http.StatusOK); err != nil {
+		return err
+	}
+	if !hasEvent(liveCase.Body, "review_packet_frozen") {
+		return errors.New("freeze audit event is missing from the live case view")
+	}
+	liveEvents, err := nestedSlice(liveCase.Body, "events")
+	if err != nil {
+		return err
+	}
+	freezeEvents := 0
+	for _, item := range liveEvents {
+		event, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if event["kind"] == "review_packet_frozen" {
+			freezeEvents++
+		}
+	}
+	if freezeEvents != 1 {
+		return fmt.Errorf("expected exactly one freeze audit event, got %d", freezeEvents)
+	}
+	if len(frozenEvents) != len(liveEvents)-1 {
+		return fmt.Errorf("freeze event leaked into the frozen packet: %d frozen vs %d live events", len(frozenEvents), len(liveEvents))
+	}
+	secondFrozenEvents, ok := second.Body["packet"].(map[string]any)
+	if !ok {
+		return errors.New("second packet is not an object")
+	}
+	entries, err := nestedSlice(secondFrozenEvents, "frozen_events")
+	if err != nil {
+		return err
+	}
+	if len(entries) != len(frozenEvents) {
+		return errors.New("later audit activity changed the stored frozen packet")
+	}
+
+	// A case without a frozen packet reads as not found, not as evidence.
+	otherCaseID, err := h.sealedCase("MET-1502")
+	if err != nil {
+		return err
+	}
+	missing, err := h.request(http.MethodGet, "/cases/"+otherCaseID+"/review-packet", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(missing, http.StatusNotFound); err != nil {
+		return err
+	}
+	if err := expectErrorCode(missing, "not_found"); err != nil {
+		return err
+	}
+
+	// A nonexistent case fails fast.
+	unknown, err := h.request(http.MethodPost, "/cases/case-9999/review-packet", map[string]any{
+		"reviewer": "Auditor-An",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(unknown, http.StatusNotFound); err != nil {
+		return err
+	}
+	return expectErrorCode(unknown, "not_found")
+}
+
+func (h *harness) sealedCase(tag string) (string, error) {
+	caseID, err := h.readyCase(tag)
+	if err != nil {
+		return "", err
+	}
+	response, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Reviewer-He",
+		"summary":  "accepted measurement sealed for external review",
+	})
+	if err != nil {
+		return "", err
+	}
+	if err := expectStatus(response, http.StatusCreated); err != nil {
+		return "", err
+	}
+	return caseID, nil
+}
+
 func newHarness() *harness {
 	server := httptest.NewServer(bootstrap.NewHandler())
 	return &harness{
@@ -549,6 +847,18 @@ func nestedBool(root map[string]any, path ...any) (bool, error) {
 		return false, fmt.Errorf("%v is not a boolean", path)
 	}
 	return flag, nil
+}
+
+func nestedFloat(root map[string]any, path ...string) (float64, error) {
+	value, err := nestedValue(root, path...)
+	if err != nil {
+		return 0, err
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return 0, fmt.Errorf("%s is not a number", strings.Join(path, "."))
+	}
+	return number, nil
 }
 
 func nestedSlice(root map[string]any, key string) ([]any, error) {

@@ -31,6 +31,10 @@ type SealCaseRequest struct {
 	Summary  string `json:"summary"`
 }
 
+type FreezeReviewPacketRequest struct {
+	Reviewer string `json:"reviewer"`
+}
+
 type DeviceResponse struct {
 	Device domain.Device `json:"device"`
 }
@@ -44,6 +48,22 @@ type CaseResponse struct {
 
 type EventsResponse struct {
 	Events []domain.AuditEvent `json:"events"`
+}
+
+type ReviewPacketResponse struct {
+	Packet domain.ReviewPacket `json:"packet"`
+}
+
+type ReviewPacketVerificationResponse struct {
+	CaseID            string `json:"case_id"`
+	PacketID          string `json:"packet_id"`
+	CaseVersion       int    `json:"case_version"`
+	SchemaVersion     int    `json:"schema_version"`
+	DigestAlg         string `json:"digest_alg"`
+	StoredDigest      string `json:"stored_digest"`
+	ComputedDigest    string `json:"computed_digest"`
+	Verified          bool   `json:"verified"`
+	CanonicalManifest string `json:"canonical_manifest"`
 }
 
 type ErrorResponse struct {

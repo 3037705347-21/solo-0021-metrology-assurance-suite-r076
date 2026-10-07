@@ -155,6 +155,29 @@
         "contracts",
         "bootstrap"
       ]
+    },
+    {
+      "id": "freeze-review-packet",
+      "name": "Freeze review packet",
+      "entry": "POST /cases/{id}/review-packet",
+      "steps": [
+        "verify the case is sealed and the evidence is complete and consistent",
+        "snapshot the case, device, selected measurement, seal, and current audit events",
+        "hash the canonical manifest with SHA-256 and store the packet under the case version",
+        "return the same stored packet for repeated freezes of that version"
+      ],
+      "success": "returns a frozen packet with a stable digest, or the identical packet on repeat",
+      "failure": "returns conflict for an unsealed or incomplete case and not found for an unfrozen case",
+      "verification": "workflowcheck freezes twice, independently recomputes the digest, and checks later audit events do not enter the packet",
+      "module_ids": [
+        "runtimecheck",
+        "httpapi",
+        "assurance",
+        "domain",
+        "repository",
+        "contracts",
+        "bootstrap"
+      ]
     }
   ],
   "complexity": {

@@ -106,3 +106,39 @@ func (s *Server) events(writer http.ResponseWriter, request *http.Request) {
 	}
 	writeJSON(writer, http.StatusOK, contracts.EventsResponse{Events: view.Events})
 }
+
+func (s *Server) freezeReviewPacket(writer http.ResponseWriter, request *http.Request) {
+	input, err := decodeJSON[contracts.FreezeReviewPacketRequest](writer, request)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	packet, created, err := s.service.GenerateReviewPacket(request.Context(), request.PathValue("id"), input)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSON(writer, status, contracts.ReviewPacketResponse{Packet: packet})
+}
+
+func (s *Server) reviewPacket(writer http.ResponseWriter, request *http.Request) {
+	packet, err := s.service.ReviewPacket(request.Context(), request.PathValue("id"))
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, contracts.ReviewPacketResponse{Packet: packet})
+}
+
+func (s *Server) verifyReviewPacket(writer http.ResponseWriter, request *http.Request) {
+	view, err := s.service.VerifyReviewPacket(request.Context(), request.PathValue("id"))
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, view)
+}

@@ -29,6 +29,9 @@ external service.
 - EvidenceSeal: the immutable closing record for a reviewed case, including the
   selected accepted measurement.
 - AuditEvent: an append-only trace of meaningful case and device changes.
+- ReviewPacket: a frozen, digest-verifiable bundle for one exact sealed case
+  version, covering the case, device, selected measurement, seal, and the audit
+  events present at freeze time.
 
 ## Workflows
 
@@ -65,6 +68,29 @@ The verifier sends `POST /cases/{id}/seal` after an accepted measurement. Only
 measurement with the smallest absolute deviation, creates exactly one evidence
 seal, moves the case to `sealed`, and rejects later mutations.
 
+### 6. Freeze Review Packet
+
+After sealing, a reviewer sends `POST /cases/{id}/review-packet` with the
+reviewer identity. The service freezes one stable packet for the exact sealed
+case version. The packet contains the case, its device, the measurement
+selected by the seal, the evidence seal, and every audit event that existed
+for the case at freeze time. A canonical manifest of those sections is hashed
+with SHA-256; the digest, digest algorithm, schema version, and scope are
+stored with the packet.
+
+Unsealed or incomplete cases (missing seal, missing selected measurement, or
+cross-case references) are rejected and can never produce a packet that looks
+like formal evidence. Repeating the request for the same case version returns
+the same stored packet (HTTP 200) instead of creating a second one. The
+freeze action appends a `review_packet_frozen` audit event after the snapshot,
+so later retroactive entries never enter an already frozen packet.
+
+`GET /cases/{id}/review-packet` reads the stored snapshot; live data never
+replaces the frozen payload. `GET /cases/{id}/review-packet/verify` recomputes
+the digest and returns the stored digest, computed digest, verification result,
+and the exact canonical manifest bytes so an external reviewer can hash the
+same content independently.
+
 ## State And Rules
 
 Device state:
@@ -90,6 +116,13 @@ Required invariants:
 - A sealed case cannot accept measurements, reopen, or seal again.
 - Every mutation that changes a case also appends an audit event in the same
   repository commit.
+- Only a sealed, evidence-complete case can be frozen into a review packet.
+- A review packet is bound to one case version: repeating the freeze for that
+  version returns the identical stored packet and identical digest.
+- A frozen packet is an immutable snapshot; later case, standard, or audit data
+  cannot rewrite it.
+- A packet's digest is SHA-256 over a canonical manifest of its declared scope
+  and must recompute to the same value on verification.
 
 ## Modules
 
@@ -112,6 +145,9 @@ Required invariants:
 - `POST /cases/{id}/measurements`
 - `POST /cases/{id}/reopen`
 - `POST /cases/{id}/seal`
+- `POST /cases/{id}/review-packet`
+- `GET /cases/{id}/review-packet`
+- `GET /cases/{id}/review-packet/verify`
 - `GET /cases/{id}/events`
 
 ## Validation Plan
@@ -121,8 +157,11 @@ bounded production smoke command under `cmd/workflowcheck`. The command starts
 an HTTP test server in the same process, calls the public routes, and verifies
 both success and failure behavior. The seal check also races two concurrent
 seal requests to prove that the repository mutation lock permits exactly one
-seal.
+seal. The review-packet check freezes a sealed case, proves that a repeated
+freeze returns the same packet and digest, recomputes the digest from the
+canonical manifest with an external hash, proves the freeze audit event stays
+out of the frozen snapshot, and rejects unsealed or missing packets.
 
-Tests are intentionally deferred for this initialization baseline. The later
-engineering-task stage will add unit and integration tests, including red/green
-verification for the workflows and their failure paths.
+Domain and service unit tests cover canonical digest determinism, tamper
+detection, evidence-completeness guards, and idempotent packet creation under
+concurrency (`go test ./... -race`).

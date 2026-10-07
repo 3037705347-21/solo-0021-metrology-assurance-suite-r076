@@ -30,6 +30,10 @@
     {
       "workflow_id": "seal-verification",
       "command": "go run ./cmd/workflowcheck --workflow seal-verification"
+    },
+    {
+      "workflow_id": "freeze-review-packet",
+      "command": "go run ./cmd/workflowcheck --workflow freeze-review-packet"
     }
   ]
 }

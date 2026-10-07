@@ -22,14 +22,18 @@ go run ./cmd/workflowcheck --workflow open-verification-case
 go run ./cmd/workflowcheck --workflow record-measurement
 go run ./cmd/workflowcheck --workflow reopen-verification-case
 go run ./cmd/workflowcheck --workflow seal-verification
+go run ./cmd/workflowcheck --workflow freeze-review-packet
 ```
 
 The workflow runner starts a fresh in-process HTTP service and exercises the
 public API. It is a production smoke command, not a unit test.
 
-Tests are intentionally deferred for this initialization baseline. The later
-engineering-task stage will add the unit and integration test suite and replace
-or extend these smoke checks with red/green verification tests.
+Unit and integration tests cover the workflows, the canonical review-packet
+digest, tamper detection, and concurrent freeze idempotency:
+
+```bash
+go test ./... -race
+```
 
 ## API
 
@@ -41,7 +45,26 @@ or extend these smoke checks with red/green verification tests.
 - `POST /cases/{id}/measurements`
 - `POST /cases/{id}/reopen`
 - `POST /cases/{id}/seal`
+- `POST /cases/{id}/review-packet` — freeze a stable review packet (201 on first freeze, 200 when the same sealed version was already frozen)
+- `GET /cases/{id}/review-packet` — read the stored frozen packet
+- `GET /cases/{id}/review-packet/verify` — recompute the digest and return the canonical manifest for independent verification
 - `GET /cases/{id}/events`
+
+## Review Packet Integrity
+
+Only a sealed, evidence-complete case can be frozen. The packet is a value
+snapshot of the case, device, seal-selected measurement, seal, and audit events
+present at freeze time; later changes (including newly appended audit events)
+never alter a stored packet, and the same case version always yields the same
+packet and digest.
+
+The digest is `sha256` over the canonical manifest: one compact JSON object
+with `schema_version`, `digest_alg`, `scope`, `case`, `device`, `seal`,
+`measurement`, and `events`, encoded with Go's `encoding/json` (HTML escaping
+disabled), scope slices sorted, events sorted by id, with no trailing newline.
+An external reviewer hashes `canonical_manifest` from the verify endpoint and
+compares it with `stored_digest`; `verified: false` means the stored payload no
+longer matches its digest.
 
 ## Layout
 
